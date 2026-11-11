@@ -391,6 +391,46 @@ describe("OpenCode V2 adapter", () => {
     expect(String(tokenRequests[0]?.[1]?.body)).toContain("refresh_token=second")
   })
 
+  it("collapses a tier family into one model and sends the selected variant's tier", async () => {
+    const network = mockNetwork()
+    const id = accountID(state.storage!.accounts[0]!)
+    const adapter = await host({
+      catalog: {
+        "gemini-4-argon-low": { displayName: "Gemini 4 Argon (Low)" },
+        "gemini-4-argon-medium": { displayName: "Gemini 4 Argon (Medium)" },
+        "gemini-4-argon-high": { displayName: "Gemini 4 Argon (High)" },
+      },
+      catalogAccounts: {
+        "antigravity-gemini-4-argon-low": [id],
+        "antigravity-gemini-4-argon-medium": [id],
+        "antigravity-gemini-4-argon-high": [id],
+      },
+    })
+
+    const grouped = adapter.models.get("antigravity-gemini-4-argon")
+    expect(grouped?.variants?.map(variant => String(variant.id))).toEqual(["low", "medium", "high"])
+    expect(adapter.models.get("antigravity-gemini-4-argon-medium")).toBeUndefined()
+
+    const send = async (tier?: string) => {
+      const model = adapter.models.get("antigravity-gemini-4-argon")!
+      model.body = tier ? { ...model.body, __antigravityTier: tier } : {}
+      const { sdk } = await adapter.sdk("antigravity-gemini-4-argon")
+      await stream(sdk, "antigravity-gemini-4-argon")
+      const target = ([input]: [RequestInfo | URL, RequestInit?]) => input instanceof Request ? input.url : String(input)
+      const calls = network.mock.calls.filter(entry => target(entry as [RequestInfo | URL, RequestInit?]).includes("v1internal:streamGenerateContent"))
+      const call = calls.at(-1)
+      expect(call).toBeDefined()
+      const [input, init] = call as [RequestInfo | URL, RequestInit?]
+      return input instanceof Request ? input.text() : String(init?.body)
+    }
+
+    // Core merges the selected variant's body into the model before the hook.
+    await expect(send()).resolves.toContain('"model":"gemini-4-argon-medium"')
+    await expect(send("high")).resolves.toContain('"model":"gemini-4-argon-high"')
+    await expect(send("low")).resolves.toContain('"model":"gemini-4-argon-low"')
+    await expect(send("high")).resolves.not.toContain("__antigravityTier")
+  })
+
   it("disables retired models from legacy config instead of exposing a native Google route", async () => {
     const adapter = await host({ catalog: { "gemini-3.8-flash-high": { displayName: "Gemini 3.8 Flash (High)", maxTokens: 1048576, maxOutputTokens: 65536 } }, legacyOverride: true })
     expect(adapter.models.get("antigravity-gemini-3-pro")?.enabled).toBe(false)
@@ -709,7 +749,9 @@ describe("discovery and account eligibility regressions", () => {
   })
 
   it("blocks a cached SDK after the only account supporting its model is disabled", async () => {
-    const model = "antigravity-gemini-3.8-flash-high"
+    // Two tiers of one family collapse into the base model; the default tier
+    // (low, no medium advertised) is what the first request sends.
+    const model = "antigravity-gemini-3.8-flash"
     state.storage!.accounts[0]!.refreshToken = "only-low"
     state.storage!.accounts.push({ ...pool().accounts[0]!, email: "high@example.test", refreshToken: "only-high" })
     const network = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {

@@ -8,7 +8,7 @@ import { authorizeAntigravity, exchangeAntigravity } from "./antigravity/oauth.t
 import { ANTIGRAVITY_REDIRECT_URI } from "./constants.ts"
 import { createAntigravityPlugin } from "./plugin.ts"
 import { accessTokenExpired, formatRefreshParts, parseRefreshParts } from "./plugin/auth.ts"
-import { OPENCODE_V2_MODEL_DEFINITIONS, buildAccountModelDefinitions, ModelCatalogCacheSchema } from "./plugin/config/models-v2.ts"
+import { OPENCODE_V2_MODEL_DEFINITIONS, TIER_BODY_MARKER, buildAccountModelDefinitions, selectableModelIDs, tierVariantGroup, tieredModelKey, ModelCatalogCacheSchema } from "./plugin/config/models-v2.ts"
 import { accountID, accountPoolIdentity, accountCredentialsIdentity, loadManagedAccounts, registerAccountManagement } from "./plugin/account-management.ts"
 import { checkAccountsQuota, type AvailableModel } from "./plugin/quota.ts"
 import { createLogger } from "./plugin/logger.ts"
@@ -45,6 +45,20 @@ function mergeBody(base: Record<string, unknown>, overlay: Record<string, unknow
       : value
   }
   return result
+}
+
+/**
+ * Rewrites a grouped base model ID in a Google SDK URL to the requested tier,
+ * or the family's default tier when no variant was selected.
+ */
+function withModelTier(input: RequestInfo | URL, tier?: string): RequestInfo | URL {
+  const url = input instanceof Request ? input.url : input instanceof URL ? input.toString() : input
+  if (typeof url !== "string") return input
+  const match = /^(.*\/models\/)([^/:?]+)(.*)$/.exec(url)
+  const key = match?.[2]
+  if (!match?.[1] || !key || !tierVariantGroup(key)) return input
+  const rewritten = `${match[1]}${tieredModelKey(key, tier)}${match[3]}`
+  return input instanceof Request ? new Request(rewritten, input) : rewritten
 }
 
 // V2 owns credentials, notifications and session repair. The legacy transport
@@ -94,7 +108,9 @@ export const AntigravityV2Plugin = Plugin.define({
       directory: ctx.location.directory,
       runtimeVersion: 2,
       canUseAccount: (account, model) => {
-        const eligible = modelAccounts[`antigravity-${resolveModelWithTier(model).actualModel}`]
+        const key = `antigravity-${resolveModelWithTier(model).actualModel}`
+        // Grouped families resolve to a tiered ID; fall back to the base key.
+        const eligible = modelAccounts[key] ?? modelAccounts[key.replace(/-(low|medium|high)$/, "")]
         return !accountCatalogLoaded || !!eligible?.includes(accountID(account))
       },
       fetch: (input, init) => {
@@ -158,8 +174,8 @@ export const AntigravityV2Plugin = Plugin.define({
           }
           if (account.enabled === false) continue
           if (!result.quota?.models) continue
-          for (const id of Object.keys(buildAccountModelDefinitions(result.quota.models))) {
-            (eligibleAccounts[id] ??= []).push(accountID(account))
+          for (const id of selectableModelIDs(result.quota.models)) {
+            (eligibleAccounts[`antigravity-${id}`] ??= []).push(accountID(account))
           }
           for (const [id, model] of Object.entries(result.quota?.models ?? {})) {
             const usable = (value: AvailableModel) => !value.disabled && value.selectable !== false
@@ -389,16 +405,22 @@ export const AntigravityV2Plugin = Plugin.define({
       if (disposed) throw new Error("Antigravity plugin has been disposed")
       const original: Fetch = typeof fallback === "function" ? fallback as Fetch : globalThis.fetch
       if (!await currentAuth()) throw new Error("Connect Google with Antigravity OAuth and enable an account to use this model")
+      let tier: string | undefined
       if (body && typeof init?.body === "string") {
-        init = { ...init, body: JSON.stringify(mergeBody(JSON.parse(init.body) as Record<string, unknown>, body)) }
+        const merged = mergeBody(JSON.parse(init.body) as Record<string, unknown>, body)
+        tier = typeof merged[TIER_BODY_MARKER] === "string" ? merged[TIER_BODY_MARKER] as string : undefined
+        delete merged[TIER_BODY_MARKER]
+        init = { ...init, body: JSON.stringify(merged) }
       }
+      // A grouped base model only exists in the catalog with its tier suffix.
+      const target = withModelTier(input, tier)
       const interceptor = await getLoader()
       const signal = AbortSignal.any([
         lifetime.signal,
         requestLifetime.signal,
         ...(init?.signal ? [init.signal] : input instanceof Request ? [input.signal] : []),
       ])
-      return outbound.run(original, () => interceptor.fetch(input instanceof URL ? input.toString() : input, { ...init, signal }))
+      return outbound.run(original, () => interceptor.fetch(target instanceof URL ? target.toString() : target, { ...init, signal }))
     })
 
     let cleaning: Promise<void> | undefined
